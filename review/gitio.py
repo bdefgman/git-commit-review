@@ -7,7 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_HEADER_RE = re.compile(r"^diff --git (.+)$")
@@ -87,12 +87,45 @@ def staged_diff(root: Path) -> str:
     )
 
 
-def staged_content(root: Path, path: str) -> Optional[str]:
-    """读取暂存区里的文件内容；二进制或读取失败返回 None。"""
-    proc = subprocess.run(["git", "show", f":{path}"], cwd=str(root), capture_output=True)
+def staged_contents(root: Path, paths: List[str]) -> Dict[str, Optional[str]]:
+    """一次 git cat-file --batch 读取多个暂存区文件；读取失败或二进制返回 None。"""
+    if not paths:
+        return {}
+
+    request = "".join(f":{path}\n" for path in paths).encode("utf-8")
+    proc = subprocess.run(["git", "cat-file", "--batch"], cwd=str(root), input=request, capture_output=True)
     if proc.returncode != 0:
-        return None
-    return proc.stdout.decode("utf-8", "replace")
+        raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git cat-file 执行失败")
+
+    data = proc.stdout
+    position = 0
+    result: Dict[str, Optional[str]] = {}
+
+    for path in paths:
+        line_end = data.find(b"\n", position)
+        if line_end < 0:
+            result[path] = None
+            continue
+
+        header = data[position:line_end].decode("utf-8", "replace")
+        position = line_end + 1
+        parts = header.split(" ")
+
+        # 格式："<oid> <type> <size>"；失败时是 "<名称> missing" 之类
+        if len(parts) != 3 or not parts[2].isdigit():
+            result[path] = None
+            continue
+
+        size = int(parts[2])
+        payload = data[position:position + size]
+        position += size + 1  # 跳过对象内容后的换行
+
+        if parts[1] != "blob" or b"\x00" in payload[:8000]:
+            result[path] = None
+            continue
+        result[path] = payload.decode("utf-8", "replace")
+
+    return result
 
 
 def parse_diff(text: str) -> List[ChangedFile]:

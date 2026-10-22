@@ -137,25 +137,45 @@ def scan_secrets(files: List[ChangedFile]) -> List[SecretHit]:
     return hits
 
 
-def collect_ignores(files: List[ChangedFile], directive: str) -> IgnoreRules:
-    """解析新增行里的忽略指令：ai-review-ignore / ai-review-ignore-file。"""
+def collect_ignores(
+    files: List[ChangedFile],
+    directive: str,
+    contents: Optional[Dict[str, str]] = None,
+) -> IgnoreRules:
+    """解析忽略指令。
+
+    - 文件级（ai-review-ignore-file）：扫描整个暂存区版本，历史提交里写的标记同样生效
+    - 行级（ai-review-ignore）：只看本次新增行
+    """
     rules = IgnoreRules()
-    pattern = re.compile(
-        re.escape(directive) + r"(-file)?(?:\s*[:：]\s*([A-Za-z0-9_,\-\s]+))?"
+    contents = contents or {}
+    file_pattern = re.compile(
+        re.escape(directive) + r"-file[ \t]*(?:[:：][ \t]*([A-Za-z0-9_,\- \t]+))?"
     )
+    line_pattern = re.compile(
+        re.escape(directive) + r"(?!-file)[ \t]*(?:[:：][ \t]*([A-Za-z0-9_,\- \t]+))?"
+    )
+
     for item in files:
+        text = contents.get(item.path)
+        if text is None:
+            text = "\n".join(line.text for line in item.added_lines())
+        file_matched = file_pattern.search(text)
+        if file_matched:
+            rules.file_rules[item.path] = _parse_rule_ids(file_matched.group(1))
+
         for line in item.added_lines():
-            matched = pattern.search(line.text)
-            if not matched:
+            if line.new_no is None:
                 continue
-            rule_ids = {
-                part.strip() for part in (matched.group(2) or "").split(",") if part.strip()
-            }
-            if matched.group(1):
-                rules.file_rules[item.path] = rule_ids
-            elif line.new_no:
-                rules.line_rules[(item.path, line.new_no)] = rule_ids
+            line_matched = line_pattern.search(line.text)
+            if line_matched:
+                rules.line_rules[(item.path, line.new_no)] = _parse_rule_ids(line_matched.group(1))
+
     return rules
+
+
+def _parse_rule_ids(raw: Optional[str]) -> Set[str]:
+    return {part.strip() for part in (raw or "").split(",") if part.strip()}
 
 
 def _skip_reason(item: ChangedFile, cfg: Config) -> Optional[str]:

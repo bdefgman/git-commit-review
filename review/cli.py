@@ -8,13 +8,14 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, hooks
 from .config import Config, ConfigError, load_config
 from .filters import SkippedFile, collect_ignores, detect_generated, scan_secrets, select_files
-from .gitio import ChangedFile, GitError, parse_diff, repo_root, staged_content, staged_diff
+from .gitio import ChangedFile, GitError, parse_diff, repo_root, staged_contents, staged_diff
 from .llm import LLMError, request_review
 from .prompt import build_messages
 from .report import RenderMeta, evaluate, render
@@ -46,6 +47,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (GitError, hooks.HookError) as exc:
         print(f"[ai-review] {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # 工具自身异常，不能伪装成"代码违规"
+        if "--debug" in (argv if argv is not None else sys.argv):
+            traceback.print_exc()
+        return _handle_internal_error(exc)
+
+
+def _handle_internal_error(exc: Exception) -> int:
+    print(f"✗ [ai-review] 工具内部错误: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    print("[ai-review] 这不是代码违规，本次审查已跳过，提交继续", file=sys.stderr)
+    print("[ai-review] 复现并反馈：aicr run --debug", file=sys.stderr)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,7 +137,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     except ReviewAborted as exc:
         return exc.exit_code
 
-    ignores = collect_ignores(candidates, cfg.ignore.inline_directive)
+    ignores = collect_ignores(candidates, cfg.ignore.inline_directive, contents)
     outcome = evaluate(raw_findings, conventions, candidates, contents, ignores, cfg)
     meta = RenderMeta(
         model=cfg.model.model,
@@ -165,10 +177,11 @@ def cmd_version(args: argparse.Namespace) -> int:
 def _collect_candidates(
     root: Path, files: List[ChangedFile], skipped: List[SkippedFile]
 ) -> Tuple[List[ChangedFile], Dict[str, str]]:
+    contents = staged_contents(root, [item.path for item in files])
     kept: List[ChangedFile] = []
-    contents: Dict[str, str] = {}
+    kept_contents: Dict[str, str] = {}
     for item in files:
-        content = staged_content(root, item.path)
+        content = contents.get(item.path)
         if content is None:
             skipped.append(SkippedFile(item.path, "无法读取暂存区内容"))
             continue
@@ -176,8 +189,8 @@ def _collect_candidates(
             skipped.append(SkippedFile(item.path, "自动生成的代码"))
             continue
         kept.append(item)
-        contents[item.path] = content
-    return kept, contents
+        kept_contents[item.path] = content
+    return kept, kept_contents
 
 
 def _review_batches(
